@@ -29,6 +29,26 @@ This repository provides a **implementation of three modules, detection module, 
 
 ---
 
+
+## CARLA 0.9.15 Installation
+
+Below are the steps to install and configure CARLA 0.9.15 on Windows.
+
+### 1. Prerequisites
+
+- OS: Windows 10 / 11 (64-bit)
+- GPU: NVIDIA GPU recommended (for better rendering)
+- Python: 3.7.x
+- Visual C++ Redistributable for Visual Studio 2015–2019
+- Git, pip, etc.
+
+### 2. Download CARLA 0.9.15
+
+1. Go to the official CARLA release page, download and unzip it
+   https://github.com/carla-simulator/carla/releases
+2. Start CARLA by `CarlaUE4.exe -windowed -carla-port=2000`
+3. Test the Python API by `python manual_control.py`
+
 ## Installation
 
 This project uses Python and standard scientific libraries.
