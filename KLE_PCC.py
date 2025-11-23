@@ -1,250 +1,149 @@
+from collections import deque
+import math
 import numpy as np
-from numpy.polynomial.legendre import leggauss
+import carla
+from misc import get_speed
 
 
-# =======================
-# KLE
-# =======================
-def compute_cov_integral(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    Approximate the covariance kernel of a 1D signal using
-    a sliding window of length `window_size`.
-    """
-    N = len(signal)
-    X = np.array([signal[i:N - window_size + i] for i in range(window_size)]).T
-    centered_X = X - np.mean(X, axis=0, keepdims=True)
-    return (centered_X.T @ centered_X) / max(1, centered_X.shape[0])
+class VehiclePIDController:
+    """Combine longitudinal & lateral PID."""
 
+    def __init__(
+        self,
+        vehicle,
+        args_lateral,
+        args_longitudinal,
+        offset=0.0,
+        max_throttle=0.75,
+        max_brake=0.3,
+        max_steering=0.8,
+    ):
+        self._vehicle = vehicle
+        self.max_throttle = max_throttle
+        self.max_brake = max_brake
+        self.max_steering = max_steering
 
-def compute_kle_coefficients(
-    signal: np.ndarray,
-    window_size: int,
-    quad_order: int,
-) -> np.ndarray:
-    """
-    Perform a Karhunen–Loève expansion (KLE) of a 1D signal.
-    """
-    N = len(signal)
-    X = np.array([signal[i:N - window_size + i] for i in range(window_size)]).T
+        self._lon_controller = PIDLongitudinalController(
+            vehicle, **args_longitudinal
+        )
+        self._lat_controller = PIDLateralController(
+            vehicle, offset=offset, **args_lateral
+        )
 
-    # covariance matrix and eigen-decomposition
-    Rxx = compute_cov_integral(signal, window_size)
-    evals, evecs = np.linalg.eigh(Rxx)
-    evecs = evecs[:, np.argsort(-evals)]  # sort by descending eigenvalue
+    def run_step(self, target_speed, target):
+        # speed control
+        accel_cmd = self._lon_controller.run_step(target_speed)
 
-    # Gauss–Legendre quadrature nodes and weights on [0, window_size - 1]
-    qx, qw = leggauss(quad_order)
-    qx = 0.5 * (qx + 1.0) * (window_size - 1)
-    qw = 0.5 * (window_size - 1) * qw
-
-    # interpolate samples and basis to quadrature nodes
-    centered_X = X - np.mean(X, axis=0, keepdims=True)
-    interp_sample = np.array([
-        np.interp(qx, np.arange(window_size), centered_X[i])
-        for i in range(centered_X.shape[0])
-    ])
-    interp_basis = np.array([
-        np.interp(qx, np.arange(window_size), evecs[:, i])
-        for i in range(evecs.shape[1])
-    ])
-
-    # integral kernel: sum_t sample(t) * basis(t) * w(t)
-    kernel = (
-        qw[np.newaxis, np.newaxis, :]
-        * interp_sample[:, np.newaxis, :]
-        * interp_basis[np.newaxis, :, :]
-    )
-    return np.sum(kernel, axis=-1)  # [T', window_size]
-
-
-# =======================
-# Sliding-window PCC
-# =======================
-def sliding_pearson_corr(
-    sig1: np.ndarray,
-    sig2: np.ndarray,
-    window_length: int,
-    step_size: int,
-):
-    """
-    Sliding-window Pearson correlation between two signals.
-
-    Parameters
-    ----------
-    sig1, sig2 : np.ndarray
-        Input time series (same length after any pre-processing).
-    window_length : int
-        Length of each sliding window.
-    step_size : int
-        Step size between successive windows.
-
-    Returns
-    -------
-    starts : np.ndarray
-        Start index of each window.
-    centers : np.ndarray
-        Center index of each window.
-    r_values : np.ndarray
-        Pearson correlation coefficient in each window.
-    """
-    centers, r_values, starts = [], [], []
-    for start in range(0, len(sig1) - window_length + 1, step_size):
-        end = start + window_length
-        a, b = sig1[start:end], sig2[start:end]
-        if np.std(a) == 0 or np.std(b) == 0:
-            r = np.nan
+        # steering control
+        if isinstance(target, carla.Waypoint):
+            steer_cmd = self._lat_controller.run_step_waypoint(target)
+        elif isinstance(target, carla.Location):
+            steer_cmd = self._lat_controller.run_step_location(target)
         else:
-            a_centered = a - a.mean()
-            b_centered = b - b.mean()
-            denom = np.sqrt((a_centered @ a_centered) * (b_centered @ b_centered)) + 1e-12
-            r = float((a_centered @ b_centered) / denom)
-        centers.append(start + window_length // 2)
-        r_values.append(r)
-        starts.append(start)
-    return np.array(starts), np.array(centers), np.array(r_values)
+            raise ValueError("Target must be carla.Waypoint or carla.Location")
 
+        control = carla.VehicleControl()
 
-# =======================
-# EWMA-based detection
-# =======================
-def ewma_persistent_deviation_detection(
-    z_abs: np.ndarray,
-    ewma_smoothing: float,
-    baseline_fraction: float,
-    sigma_threshold: float,
-    consecutive_required: int,
-):
-    """
-    Apply an EWMA-based persistent deviation detector to |z|-scores.
-
-    Parameters
-    ----------
-    z_abs : np.ndarray
-        Absolute Fisher z-transformed correlation values.
-    ewma_smoothing : float
-        EWMA smoothing factor (lambda in (0, 1)).
-    baseline_fraction : float
-        Fraction of the earliest windows used to estimate the baseline
-        mean and variance of |z|.
-    sigma_threshold : float
-        Threshold in units of the EWMA standard deviation.
-    consecutive_required : int
-        Number of consecutive threshold crossings required to declare
-        a persistent anomaly.
-
-    Returns
-    -------
-    ewma_values : np.ndarray
-        EWMA of |z| over time.
-    scores : np.ndarray
-        Normalized deviation scores (in units of sigma).
-    anomaly_flags : np.ndarray of bool
-        Boolean mask indicating detected anomalies.
-    """
-    # select baseline region
-    num_windows = len(z_abs)
-    num_baseline = max(1, int(baseline_fraction * num_windows))
-    baseline = z_abs[:num_baseline]
-    baseline = baseline[np.isfinite(baseline)]
-    if baseline.size == 0:
-        baseline = z_abs[np.isfinite(z_abs)]
-
-    # robust estimate of baseline mean and sigma
-    mu_abs = float(np.median(baseline))
-    mad = float(np.median(np.abs(baseline - mu_abs)))
-    sigma_abs = 1.4826 * mad if np.isfinite(mad) else float(np.std(baseline, ddof=1) + 1e-12)
-    sigma_abs_ewma = float(
-        np.sqrt(ewma_smoothing / (2.0 - ewma_smoothing)) * max(sigma_abs, 1e-12)
-    )
-
-    # EWMA recursion and persistent deviation test
-    ewma_values = np.empty_like(z_abs, dtype=float)
-    scores = np.empty_like(z_abs, dtype=float)
-    anomaly_flags = np.zeros_like(z_abs, dtype=bool)
-
-    S_abs = mu_abs
-    breach_run = 0
-
-    for i, za in enumerate(z_abs):
-        if np.isfinite(za):
-            S_abs = ewma_smoothing * float(za) + (1.0 - ewma_smoothing) * S_abs
-            drift_abs = abs(S_abs - mu_abs)
-            score = drift_abs / (sigma_abs_ewma + 1e-12)
+        # map accel_cmd ∈ [-1,1] to throttle / brake
+        if accel_cmd >= 0.0:
+            control.throttle = min(accel_cmd, self.max_throttle)
+            control.brake = 0.0
         else:
-            score = np.nan
+            control.throttle = 0.0
+            control.brake = min(-accel_cmd, self.max_brake)
 
-        ewma_values[i] = S_abs
-        scores[i] = score
+        # saturate steering
+        steer_cmd = float(steer_cmd)
+        steer_cmd = max(-self.max_steering, min(self.max_steering, steer_cmd))
+        control.steer = steer_cmd
 
-        if not np.isfinite(score):
-            breach_run = 0
-            anomaly_flags[i] = False
+        control.hand_brake = False
+        control.manual_gear_shift = False
+        return control
+
+
+class PIDLongitudinalController:
+    """PID on speed."""
+
+    def __init__(self, vehicle, K_P=1.0, K_I=0.0, K_D=0.0, dt=0.03):
+        self._vehicle = vehicle
+        self._k_p = K_P
+        self._k_i = K_I
+        self._k_d = K_D
+        self._dt = dt
+        self._error_buffer = deque(maxlen=10)
+
+    def run_step(self, target_speed, debug=False):
+        current_speed = get_speed(self._vehicle)
+        return self._pid_control(target_speed, current_speed)
+
+    def _pid_control(self, target_speed, current_speed):
+        error = float(target_speed - current_speed)
+        self._error_buffer.append(error)
+
+        if len(self._error_buffer) >= 2:
+            de = (self._error_buffer[-1] - self._error_buffer[-2]) / self._dt
+            ie = sum(self._error_buffer) * self._dt
         else:
-            is_breach = score >= sigma_threshold
-            breach_run = breach_run + 1 if is_breach else 0
-            anomaly_flags[i] = breach_run >= consecutive_required
+            de = 0.0
+            ie = 0.0
 
-    return ewma_values, scores, anomaly_flags
+        cmd = self._k_p * error + self._k_d * de + self._k_i * ie
+        return float(np.clip(cmd, -1.0, 1.0))
 
 
-# =======================
-# End-to-end example (KLE + PCC + EWMA) on two signals
-# =======================
-def run_kle_pcc_ewma(
-    signal_1: np.ndarray,
-    signal_2: np.ndarray,
-    kle_window_size: int,
-    kle_quad_order: int,
-    pcc_window_length: int,
-    pcc_step_size: int,
-    ewma_smoothing: float,
-    baseline_fraction: float,
-    sigma_threshold: float,
-    consecutive_required: int,
-):
-    """
-    High-level pipeline combining:
-      1) KLE on each signal (first KL mode),
-      2) sliding-window Pearson correlation on KL coefficients,
-      3) Fisher z-transform and absolute value,
-      4) EWMA-based persistent deviation detection.
-    """
-    # first KL mode of each signal
-    kle1 = compute_kle_coefficients(signal_1, window_size=kle_window_size,
-                                    quad_order=kle_quad_order)[:, 0]
-    kle2 = compute_kle_coefficients(signal_2, window_size=kle_window_size,
-                                    quad_order=kle_quad_order)[:, 0]
+class PIDLateralController:
+    """PID on heading / lateral error toward target location."""
 
-    # sliding-window Pearson correlation on KL coefficients
-    starts, centers, r_values = sliding_pearson_corr(
-        kle1, kle2,
-        window_length=pcc_window_length,
-        step_size=pcc_step_size,
-    )
+    def __init__(self, vehicle, offset=0.0, K_P=6.0, K_I=0.0, K_D=0.1, dt=0.02):
+        self._vehicle = vehicle
+        self._k_p = K_P
+        self._k_i = K_I
+        self._k_d = K_D
+        self._dt = dt
+        self._offset = offset
+        self._e_buffer = deque(maxlen=10)
 
-    # Fisher z-transform and absolute value
-    eps = 1e-6
-    r_clipped = np.clip(r_values, -1.0 + eps, 1.0 - eps)
-    z_values = np.arctanh(r_clipped)
-    z_values[~np.isfinite(r_values)] = np.nan
-    z_abs = np.abs(z_values)
+    def run_step_waypoint(self, waypoint):
+        return self._pid_control(
+            waypoint.transform.location, self._vehicle.get_transform()
+        )
 
-    # EWMA-based persistent deviation detection
-    ewma_values, scores, anomaly_flags = ewma_persistent_deviation_detection(
-        z_abs=z_abs,
-        ewma_smoothing=ewma_smoothing,
-        baseline_fraction=baseline_fraction,
-        sigma_threshold=sigma_threshold,
-        consecutive_required=consecutive_required,
-    )
+    def run_step_location(self, location):
+        return self._pid_control(location, self._vehicle.get_transform())
 
-    return {
-        "window_starts": starts,
-        "window_centers": centers,
-        "pearson_r": r_values,
-        "fisher_z": z_values,
-        "abs_fisher_z": z_abs,
-        "ewma_abs_z": ewma_values,
-        "scores": scores,
-        "anomaly_flags": anomaly_flags,
-    }
+    def _pid_control(self, target_location, vehicle_transform):
+        ego_loc = vehicle_transform.location
+        v_vec = vehicle_transform.get_forward_vector()
+        v_vec = np.array([v_vec.x, v_vec.y, 0.0], dtype=float)
+
+        w_vec = np.array(
+            [target_location.x - ego_loc.x,
+             target_location.y - ego_loc.y,
+             0.0],
+            dtype=float,
+        )
+
+        denom = np.linalg.norm(v_vec) * np.linalg.norm(w_vec)
+        if denom < 1e-6:
+            angle = 0.0
+        else:
+            cos_angle = np.clip(np.dot(v_vec, w_vec) / denom, -1.0, 1.0)
+            angle = math.acos(cos_angle)
+
+        cross = np.cross(v_vec, w_vec)
+        if cross[2] < 0:
+            angle *= -1.0
+
+        angle += self._offset
+
+        self._e_buffer.append(angle)
+        if len(self._e_buffer) >= 2:
+            de = (self._e_buffer[-1] - self._e_buffer[-2]) / self._dt
+            ie = sum(self._e_buffer) * self._dt
+        else:
+            de = 0.0
+            ie = 0.0
+
+        steer = self._k_p * angle + self._k_d * de + self._k_i * ie
+        return float(np.clip(steer, -1.0, 1.0))
