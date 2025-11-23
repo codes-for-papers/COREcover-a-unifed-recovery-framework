@@ -39,7 +39,11 @@ This project uses Python and standard scientific libraries.
 - `numpy`
 - `pandas`
 - `scipy`
-- math
+- `math`
+- `carla`
+- `os`
+- `time`
+- `scipy.optimize`
 
 You can install dependencies via:
 
