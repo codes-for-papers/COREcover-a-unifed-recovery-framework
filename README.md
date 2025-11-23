@@ -44,6 +44,9 @@ This project uses Python and standard scientific libraries.
 - `os`
 - `time`
 - `scipy.optimize`
+- `sys`
+- `weakref`
+- `argparse`
 
 You can install dependencies via:
 
